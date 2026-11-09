@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Photos and captures (privacy)
+captures/
+*.jpg
+*.jpeg
+*.png
+
+# Python
+agent-env/
+.venv/
+__pycache__/
+*.pyc
+
+# Data and models
+*.db
+*.pt
+
+# macOS
+.DS_Store
