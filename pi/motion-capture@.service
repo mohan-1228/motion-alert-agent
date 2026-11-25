@@ -1,0 +1,45 @@
+# systemd service: run pi/motion_capture.py at boot and keep it running.
+#
+# systemd is Linux's service manager: it starts programs at boot, restarts
+# them if they crash, and collects their output into the system log.
+#
+# The "@" in the filename makes this a *template*. "%i" below is replaced by
+# whatever comes after the @ when the service is enabled, e.g.
+#     motion-capture@alice  ->  runs as user alice, from /home/alice/...
+# That way no username is written into this (public) repo.
+#
+# Install on the Pi (asks for your sudo password once):
+#     bash pi/install_service.sh
+# Useful commands afterwards:
+#     systemctl status motion-capture@$USER      # running? last log lines
+#     journalctl -u motion-capture@$USER -f      # follow the log live (Ctrl+C to stop)
+#     sudo systemctl restart motion-capture@$USER   # after a `git pull`
+
+[Unit]
+Description=Motion alert: PIR capture and upload to the Mac (user %i)
+# Start after the network is up. The script copes without it (failed uploads
+# are kept on the SD card), but starting later avoids pointless failures at boot.
+After=network-online.target
+Wants=network-online.target
+# If the script fails to start 5 times within 5 minutes (e.g. .env missing),
+# stop retrying instead of looping forever and flooding the log.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Run as the normal user, not root: the script only needs GPIO and the camera,
+# which the user already has through the "gpio" and "video" groups.
+User=%i
+WorkingDirectory=/home/%i/motion-alert-agent
+# -u = unbuffered output, so print() lines reach the log immediately
+# instead of waiting in a buffer.
+ExecStart=/usr/bin/python3 -u pi/motion_capture.py
+# If it ever exits (crash, error), start it again after 10 s.
+Restart=always
+RestartSec=10
+
+[Install]
+# "multi-user.target" is systemd's name for "normal boot finished".
+# Enabling the service hooks it in there, so it starts at every boot.
+WantedBy=multi-user.target
