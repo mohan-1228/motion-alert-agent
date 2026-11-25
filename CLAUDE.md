@@ -56,11 +56,17 @@ curl http://localhost:8000/health                                       # {"ok":
 - `POST /upload` takes the **raw JPEG as the request body**, plus the header `Authorization: Bearer <UPLOAD_TOKEN>`. It replies **202** straight away. Errors: 401 bad token, 503 queue full (20), 411 no Content-Length, 413 over 10 MB, 415 not a JPEG (magic bytes are checked).
 - Don't switch to `UploadFile` or multipart. FastAPI would receive the whole body *before* the token check, so an unauthenticated client could fill the disk. The handler checks the token first, then streams the body with a byte counter.
 - Plain HTTP: the token and the photos cross the LAN unencrypted. That's acceptable on a trusted home network. Never port-forward 8000 to the internet.
-- Descriptions are logged only at DEBUG level, because logs outlive the deleted photos. On startup, leftover photos from a crash are deleted. On shutdown, queued photos are dropped and deleted.
+- Descriptions are logged only at DEBUG level, because logs outlive the deleted photos. Set the env var `LOG_LEVEL=DEBUG` to see them. uvicorn's `--log-level` does not affect our loggers. `httpx` is pinned to WARNING and `urllib3` to ERROR, because urllib3 logs full URLs (including the webhook secret) at DEBUG and in one rare warning. On startup, leftover photos from a crash are deleted. On shutdown, queued photos are dropped and deleted.
 - Uploads are saved under server-chosen names (`YYYYMMDD_HHMMSS_<rand>.jpg`) in `~/motion-alerts/incoming/`, outside the repo. The client's filename is never used.
-- A single worker thread takes jobs from a `queue.Queue` and runs `analyze()` one at a time, because `analyze()` isn't re-entrant. Then it calls `handle_result()` (currently it only logs), and deletes the upload and the annotated copy in a `finally` block.
+- A single worker thread takes jobs from a `queue.Queue` and runs `analyze()` one at a time, because `analyze()` isn't re-entrant. Then it calls `handle_result()`, and deletes the upload and the annotated copy in a `finally` block.
 - The worker must never die. `ValueError` (unusable image) logs one warning line; any other exception logs a traceback, and the loop continues.
-- `handle_result()` is where Discord alerting plugs in.
+- `handle_result()` sends the Discord alert (`mac/discord_alert.py`) before the files are deleted.
+  - **Alert pausing (`_quiet_until`):** after a *successful* alert, alerts pause for `ALERT_COOLDOWN_SECONDS` (default 60). After a *failed* one they pause for `max(FAILURE_BACKOFF_SECONDS=60, retry_after)`. This is a circuit breaker, so a Discord outage can't back up the queue. While alerts are paused, `analyze(want_description=False)` skips the LLM (under 1 s instead of about 25 s).
+  - The worker calls `alerts_enabled()` **once** per photo and passes the result both to `analyze()` and to `handle_result()`, so "describe?" and "send?" can't disagree.
+  - **Log-only mode:** if `DISCORD_WEBHOOK_URL` is empty, the server still runs but sends nothing, and it skips descriptions. A URL that doesn't start with `https://discord.com/api/webhooks/` stops startup.
+  - **`send_alert()` never raises** and returns `SendResult(ok, retry_after)`. It uses timeouts of (5, 15) s and makes at most 3 attempts, with no sleep after the last one. On a 429 it waits for `retry_after` only if it's 10 s or less. `retry_after` is parsed defensively: dates, NaN and negative values fall back to 1 s. It retries 5xx and network errors, and doesn't retry other 4xx; for those it logs only Discord's `code` and `message`, never the body, which can echo the description. It reopens the file on each attempt so retries don't send 0 bytes, and adds `wait=true` via `params=` so a URL that already has a query string still works.
+  - **Message format:** multipart with `files[0]` and `payload_json` (an embed whose image is `attachment://<filename>`), sent to `?wait=true`. `allowed_mentions: {"parse": []}` stops LLM text from pinging `@everyone`.
+  - **Never log the webhook URL or `str()` of a requests exception,** because both can contain the secret. Log `e.__class__.__name__` instead.
 
 ## Mac setup
 
@@ -84,6 +90,6 @@ python3 pi/motion_capture.py  # 30s sensor warm-up, then saves a photo on each m
 
 ## Configuration and privacy
 
-- Secrets go in `.env` (template: `.env.example`): `DISCORD_WEBHOOK_URL`, `MAC_SERVER_URL` (where the Pi will send captures), and `UPLOAD_TOKEN` (auth for those uploads). Nothing reads these yet. They are for the planned Pi→Mac upload and Discord alerting. Load them with `python-dotenv`, and never log their values.
+- Secrets go in `.env` (template: `.env.example`): `DISCORD_WEBHOOK_URL`, `MAC_SERVER_URL` (where the Pi will send captures), and `UPLOAD_TOKEN` (auth for those uploads). The Mac server reads `UPLOAD_TOKEN` (required, 16+ characters) and `DISCORD_WEBHOOK_URL` (optional; without it the server runs in log-only mode). It also takes the optional `ALERT_COOLDOWN_SECONDS` and `LOG_LEVEL`. The Pi will read `MAC_SERVER_URL` and `UPLOAD_TOKEN`. Load them with `python-dotenv`, and never log their values.
 - `.gitignore` excludes every image (`*.jpg`, `*.png`, `captures/`), along with `*.db` and `*.pt` model weights, for privacy and size reasons. Don't commit photos or model files.
 - Python virtualenvs are expected at `agent-env/` or `.venv/`.

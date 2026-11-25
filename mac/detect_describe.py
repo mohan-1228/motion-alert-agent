@@ -202,12 +202,17 @@ def clean_description(text: str | None) -> str | None:
 
 
 # --- Both stages together -------------------------------------------------------------
-def analyze(model: YOLO, image_path: Path, out_dir: Path | None = None) -> Analysis:
+def analyze(model: YOLO, image_path: Path, out_dir: Path | None = None,
+            want_description: bool = True) -> Analysis:
     """Full pipeline for one photo. This is what the server will call.
 
     out_dir: where to save the annotated copy. Defaults to the photo's own
     folder. The server should pass its own folder and give uploads unique
     names, so two photos can never overwrite each other's output.
+
+    want_description: set False to skip the LLM (stage 2) even if a person is
+    found. The server does this during its alert cooldown: no alert will be
+    sent, so spending ~30 s and ~3 GB of RAM on a description would be waste.
 
     Not safe to run twice at the same time: the YOLO model is shared and two
     LLM loads at once would strain 8 GB of RAM. The server must process one
@@ -233,7 +238,8 @@ def analyze(model: YOLO, image_path: Path, out_dir: Path | None = None) -> Analy
     return Analysis(
         person_count=count,
         top_confidence=top_conf,
-        description=describe(image_path),   # describe the clean photo, not the one with boxes
+        # Describe the clean photo, not the one with boxes drawn on it.
+        description=describe(image_path) if want_description else None,
         annotated_path=annotated,
     )
 

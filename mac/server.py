@@ -24,6 +24,7 @@ import os
 import queue
 import secrets
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -34,6 +35,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 
 # Importing detect_describe also sets YOLO_AUTOINSTALL=false before ultralytics loads.
 from detect_describe import Analysis, analyze, load_detector
+from discord_alert import looks_like_webhook, send_alert
 
 # --- Settings -------------------------------------------------------------------
 
@@ -52,12 +54,21 @@ MAX_QUEUE = 20                        # if 20 photos are already waiting, refuse
 JPEG_MAGIC = b"\xff\xd8\xff"          # every JPEG file starts with these 3 bytes
 
 # logging is like print(), but every line gets a time and level (INFO/WARNING/ERROR),
-# and it's safe to use from several threads at once.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# and it's safe to use from several threads at once. Set LOG_LEVEL=DEBUG in the
+# environment to also see descriptions. (uvicorn's --log-level flag does NOT
+# affect these lines; it only controls uvicorn's own messages.)
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("server")
-# The httpx library (used by the ollama client) logs every HTTP call at INFO.
-# That's noise for us, so only show its warnings and errors.
+# Libraries that make HTTP calls log every request. Keep them at WARNING even
+# in DEBUG mode: httpx (used by ollama) is just noisy, but urllib3 (used by
+# requests) logs the full URL, and the Discord webhook URL is a secret.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# urllib3 at ERROR, not WARNING: one of its rare warnings ("Failed to parse
+# headers (url=...)") includes the URL too.
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # The shared secret the Pi must send. Fail at startup if it's missing:
 # a server that silently accepts everyone is worse than one that won't start.
@@ -69,25 +80,90 @@ if len(UPLOAD_TOKEN) < 16:
         "and put UPLOAD_TOKEN=<that value> in .env"
     )
 
+# Discord webhook (a secret URL). Unlike the token, a missing webhook doesn't
+# stop the server: it runs in "log-only" mode, which is handy for testing.
+# But it says so loudly at startup, because a security alert system that
+# silently sends nothing is the worst kind of broken.
+# .strip() removes stray spaces/newlines from copy-pasting, which would
+# otherwise make every request fail with an "invalid URL" error.
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+if DISCORD_WEBHOOK_URL and not looks_like_webhook(DISCORD_WEBHOOK_URL):
+    raise SystemExit(
+        "DISCORD_WEBHOOK_URL doesn't look like a Discord webhook "
+        "(should start with https://discord.com/api/webhooks/). Check .env."
+    )
+
+# After an alert is sent, don't send another for this many seconds. Someone
+# standing at the door for 2 minutes would otherwise produce ~10 alerts.
+ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "60"))
+
+# After a FAILED send (Discord down, unreachable, rate limiting us), pause
+# alerts this long. This is a simple "circuit breaker": without it, during an
+# outage every person photo would spend ~30 s on the LLM plus up to ~80 s on
+# failing retries, and the queue would back up for half an hour.
+FAILURE_BACKOFF_SECONDS = 60
+
 # The to-do list between the web handler and the worker thread.
 jobs: queue.Queue[Path | None] = queue.Queue(maxsize=MAX_QUEUE)
 
+# Alerts are paused until this time (time.monotonic() seconds), and why.
+# monotonic() is a clock that only moves forward: unlike the wall clock it
+# can't jump if the Mac adjusts its time, so "is it later than X" is always right.
+# Only the worker thread reads/writes these, so no lock is needed.
+_quiet_until = 0.0
+_quiet_reason = ""
+
 
 # --- What to do with a finished analysis ----------------------------------------------
-def handle_result(photo: Path, result: Analysis) -> None:
-    """Act on one analysis. For now: log it.
+def alerts_enabled() -> bool:
+    """Would a person in a photo produce an alert right now?"""
+    return bool(DISCORD_WEBHOOK_URL) and time.monotonic() >= _quiet_until
 
-    The next feature (Discord alerts) will send result.annotated_path and
-    result.description to Discord here, before the files are deleted.
+
+def pause_alerts(seconds: float, reason: str) -> None:
+    """Send no alerts (and skip LLM descriptions) for `seconds`."""
+    global _quiet_until, _quiet_reason
+    _quiet_until = time.monotonic() + seconds
+    _quiet_reason = reason
+
+
+def handle_result(photo: Path, result: Analysis, alert_allowed: bool) -> None:
+    """Act on one analysis: log it, and send a Discord alert if appropriate.
+
+    alert_allowed: alerts_enabled() as checked by the worker *before* analysis.
+    We use that one decision for both "describe?" and "send?". If we checked
+    again here, a cooldown ending during the ~25 s analysis would send an
+    alert without a description.
+
+    Runs on the worker thread *before* the files are deleted, so the
+    annotated photo still exists to be uploaded.
     """
     if result.person_count == 0:
         log.info("%s: no person, ignoring", photo.name)
         return
     # Count and confidence only. The description ("person in a red jacket at
     # the door") is personal data: logs stick around long after the photos are
-    # deleted, so it's only shown when debugging (--log-level debug).
+    # deleted, so it's only shown when debugging (LOG_LEVEL=DEBUG).
     log.info("%s: PERSON x%d (conf %.2f)", photo.name, result.person_count, result.top_confidence)
     log.debug("%s: description: %s", photo.name, result.description)
+
+    if not DISCORD_WEBHOOK_URL:
+        log.info("%s: log-only mode, no alert sent", photo.name)
+        return
+    if not alert_allowed:
+        log.info("%s: alert suppressed (%s)", photo.name, _quiet_reason)
+        return
+
+    sent = send_alert(DISCORD_WEBHOOK_URL, result.annotated_path,
+                      result.person_count, result.top_confidence, result.description)
+    if sent.ok:
+        pause_alerts(ALERT_COOLDOWN_SECONDS, "cooldown after an alert")
+    else:
+        # Back off for at least FAILURE_BACKOFF_SECONDS, or longer if Discord
+        # told us exactly how long it'll keep refusing us.
+        backoff = max(FAILURE_BACKOFF_SECONDS, sent.retry_after or 0)
+        log.warning("%s: alert FAILED; pausing alerts for %.0fs", photo.name, backoff)
+        pause_alerts(backoff, "backing off after a failed alert")
 
 
 def annotated_path_for(photo: Path) -> Path:
@@ -109,8 +185,12 @@ def worker(model) -> None:
         if photo is None:           # None is our "please stop" signal at shutdown
             break
         try:
-            result = analyze(model, photo, out_dir=ANNOTATED_DIR)
-            handle_result(photo, result)
+            # Decide ONCE per photo whether an alert may go out, and only pay
+            # for the slow LLM description if it may.
+            alert_allowed = alerts_enabled()
+            result = analyze(model, photo, out_dir=ANNOTATED_DIR,
+                             want_description=alert_allowed)
+            handle_result(photo, result, alert_allowed)
         except ValueError as e:
             # An *expected* problem (a corrupt or unreadable photo): one clear
             # line is enough, a 30-line traceback would just bury real bugs.
@@ -162,7 +242,8 @@ async def lifespan(app: FastAPI):
             delete_photo_files(waiting)
         jobs.task_done()
     jobs.put(None)             # ask the worker to stop after its current photo
-    thread.join(timeout=150)   # one photo can take up to ~2 min (Ollama timeout)
+    # One photo can take up to ~2 min (Ollama timeout) + ~80 s (Discord retries).
+    thread.join(timeout=240)
 
 
 app = FastAPI(title="motion-alert receiver", lifespan=lifespan)
