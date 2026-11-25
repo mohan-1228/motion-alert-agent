@@ -32,6 +32,20 @@ Planned Mac dependencies: `ultralytics`, `fastapi`, `uvicorn`, `python-multipart
 
 Licensing: Ultralytics is AGPL-3.0. That's fine for a personal, local project, but if the repo is published it must stay AGPL-compatible.
 
+## Running (on the Mac)
+
+```bash
+.venv/bin/python mac/detect_describe.py PHOTO.jpg   # YOLO person check, then LLM description if a person is found
+```
+
+- `mac/detect_describe.py` holds the detection and description logic. `analyze(model, path)` is the function the server will reuse. Load YOLO once with `load_detector()` and pass the model in.
+- It writes `<photo>_annotated.jpg` (with boxes drawn) to `out_dir`, which defaults to the photo's own folder. When testing, use copies outside the repo.
+- If the description fails (Ollama is down, the model isn't pulled, or the call times out), `description` is `None` and the person count is still returned. A failed description must never block an alert.
+- `YOLO_AUTOINSTALL=false` is set before `import ultralytics`, so Ultralytics can't pip-install extras at runtime (it tried to add `pi-heif`). Keep it in any new entry point that imports ultralytics, and add needed packages to `requirements.txt` instead.
+- `analyze()` is not re-entrant. The server must process one photo at a time and give uploads unique names.
+- `clean_description()` trims answers that were cut off at the token cap back to the last full sentence, because the small model doesn't reliably obey length limits. Descriptions can also hallucinate small details. Treat them as context; YOLO's person count is what decides whether to alert.
+- With `keep_alive=0`, each description takes about 30 s, mostly reloading the model into RAM. This is a deliberate choice for an 8 GB Mac.
+
 ## Mac setup
 
 ```bash
@@ -40,7 +54,7 @@ pip install -r mac/requirements.txt   # pinned versions
 ollama pull qwen2.5vl:3b
 ```
 
-Verified on 2026-11-25: torch 2.15.0 sees MPS. `yolo26n.pt` (auto-downloaded into the working directory, gitignored) found 4 persons in Ultralytics' sample `bus.jpg`, and `qwen2.5vl:3b` described them correctly.
+Verified on 2026-11-25: torch 2.15.0 sees MPS. `mac/yolo26n.pt` (auto-downloaded there on first use, gitignored) found 4 persons in Ultralytics' sample `bus.jpg`, and `qwen2.5vl:3b` described them correctly.
 
 ## Running (on the Pi)
 
