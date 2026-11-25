@@ -17,14 +17,17 @@
 
 [Unit]
 Description=Motion alert: PIR capture and upload to the Mac (user %i)
-# Start after the network is up. The script copes without it (failed uploads
-# are kept on the SD card), but starting later avoids pointless failures at boot.
-After=network-online.target
+# Start after the network is up and after avahi-daemon (which resolves
+# ".local" names like the Mac's). The script copes without them (failed
+# uploads are kept on the SD card), but starting later avoids pointless
+# failures at boot.
+After=network-online.target avahi-daemon.service
 Wants=network-online.target
-# If the script fails to start 5 times within 5 minutes (e.g. .env missing),
-# stop retrying instead of looping forever and flooding the log.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Never give up restarting. systemd's default is to stop after 5 failed
+# starts in 10 s; a hiccup at boot (e.g. GPIO not ready yet) would then
+# leave the service dead until someone noticed: a silently broken security
+# system. Retrying forever every 30 s costs almost nothing.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -35,9 +38,9 @@ WorkingDirectory=/home/%i/motion-alert-agent
 # -u = unbuffered output, so print() lines reach the log immediately
 # instead of waiting in a buffer.
 ExecStart=/usr/bin/python3 -u pi/motion_capture.py
-# If it ever exits (crash, error), start it again after 10 s.
+# If it ever exits (crash, error), start it again after 30 s.
 Restart=always
-RestartSec=10
+RestartSec=30
 
 [Install]
 # "multi-user.target" is systemd's name for "normal boot finished".

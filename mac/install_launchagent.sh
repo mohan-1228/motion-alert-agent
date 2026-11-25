@@ -34,8 +34,13 @@ mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
 #   RunAtLoad          start as soon as the agent is loaded (i.e. at login)
 #   KeepAlive          if it ever exits, start it again
 #   ThrottleInterval   wait at least 10 s between restarts (no tight crash loops)
+#   EnvironmentVariables  PYTHONUNBUFFERED=1: when output goes to a file,
+#                      Python holds print() output in a buffer and writes it
+#                      later (or never, if killed). This makes it write at once.
 #   StandardOutPath /  where print()/log output goes
 #   StandardErrorPath
+# --no-access-log: uvicorn would otherwise log every HTTP request; our own
+# "Queued ..." lines already record each upload, and the file isn't rotated.
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -49,7 +54,12 @@ cat > "$PLIST" <<EOF
         <string>server:app</string>
         <string>--host</string>    <string>0.0.0.0</string>
         <string>--port</string>    <string>8000</string>
+        <string>--no-access-log</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key> <string>1</string>
+    </dict>
     <key>WorkingDirectory</key>  <string>$REPO</string>
     <key>RunAtLoad</key>         <true/>
     <key>KeepAlive</key>         <true/>
@@ -63,7 +73,13 @@ plutil -lint "$PLIST" >/dev/null   # check the XML is valid before handing it to
 
 # If an older version is loaded, unload it first so the new settings apply.
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-launchctl bootstrap "$DOMAIN" "$PLIST"     # load it (and, because of RunAtLoad, start it)
+# Load it (and, because of RunAtLoad, start it). Unloading takes a moment, and
+# loading too soon fails with "Input/output error", so retry a few times.
+for attempt in 1 2 3 4 5; do
+    launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null && break
+    [ "$attempt" = 5 ] && { echo "launchctl bootstrap failed" >&2; exit 1; }
+    sleep 1
+done
 
 echo "Installed $PLIST"
 echo "Log:     tail -f $LOG_DIR/server.log"

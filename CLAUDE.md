@@ -98,6 +98,30 @@ python3 pi/motion_capture.py  # 30s sensor warm-up, then captures and uploads on
 - The Pi is a Raspberry Pi 4 (Debian 13, Python 3.13) with a git clone of this repo at `~/motion-alert-agent`. Deploy with `git pull` on the Pi; never copy files by hand. The repo is **public**, so never commit hostnames, IPs, usernames or tokens. Use placeholders.
 - The Mac reaches the Pi over SSH with key auth (`~/.ssh/id_ed25519`). The Pi reaches the Mac by its `.local` mDNS name on port 8000. The Mac server must run with `--host 0.0.0.0` for the Pi to reach it.
 
+## Running at boot (auto-start)
+
+Both sides run as managed services that start automatically and are restarted if they crash. Don't also start them by hand: two copies would fight over port 8000 (Mac) or the camera (Pi).
+
+**Pi: systemd** (`pi/motion-capture@.service`, a template where `%i` is the username, so no username is in the repo):
+```bash
+bash pi/install_service.sh                    # one-time install (asks for the sudo password)
+systemctl status motion-capture@$USER         # running? recent log lines
+journalctl -u motion-capture@$USER -f         # follow the log
+sudo systemctl restart motion-capture@$USER   # after `git pull`
+```
+It starts at boot without anyone logging in, after `network-online.target` and `avahi-daemon` (for `.local` resolution). It restarts 30 s after any exit (`Restart=always`) and **never gives up** (`StartLimitIntervalSec=0`). A start limit would leave the service dead after a boot-time hiccup, which is a silent failure. Re-running `install_service.sh` is safe; it restarts the service so file changes take effect. It runs as the normal user (GPIO and camera access come from the `gpio`/`video` groups), with `python3 -u` so output reaches the journal straight away.
+
+**Mac: launchd LaunchAgent** (`mac/install_launchagent.sh` generates `~/Library/LaunchAgents/local.motion-alert.server.plist`; the plist isn't committed because it contains absolute paths with the username):
+```bash
+bash mac/install_launchagent.sh                                     # install or update, and start
+tail -f ~/Library/Logs/motion-alert/server.log                      # log
+launchctl kickstart -k gui/$(id -u)/local.motion-alert.server       # restart after `git pull`
+launchctl bootout gui/$(id -u)/local.motion-alert.server            # stop and unload
+```
+It uses `RunAtLoad`, `KeepAlive` and `ThrottleInterval=10`, plus `PYTHONUNBUFFERED=1` so output reaches the log file straight away. uvicorn runs with `--no-access-log`; `server.log` isn't rotated, and without per-request lines it grows only by a few lines per motion event. A LaunchAgent (not a LaunchDaemon) runs as the user, like Homebrew's Ollama agent, but it **starts only at login**. For unattended operation the Mac needs automatic login (not possible with FileVault on) and `sudo pmset -a autorestart 1`, so it powers back on after an outage. Sleep must stay off (`pmset sleep 0`). Ollama may start after the server; that's fine, because descriptions fail soft until it's up.
+
+Known gap: photos kept on the Pi after a failed upload (`~/captures`) are **never re-sent**. They're only capped at 100. A retry pass for them would be a future feature.
+
 ## Configuration and privacy
 
 - Secrets go in `.env` (template: `.env.example`): `DISCORD_WEBHOOK_URL`, `MAC_SERVER_URL` (where the Pi will send captures), and `UPLOAD_TOKEN` (auth for those uploads). The Mac server reads `UPLOAD_TOKEN` (required, 16+ characters) and `DISCORD_WEBHOOK_URL` (optional; without it the server runs in log-only mode). It also takes the optional `ALERT_COOLDOWN_SECONDS` and `LOG_LEVEL`. The Pi reads only `MAC_SERVER_URL` and `UPLOAD_TOKEN`, using its own `load_env()`. The Mac loads `.env` with `python-dotenv`. Never log any of these values.
