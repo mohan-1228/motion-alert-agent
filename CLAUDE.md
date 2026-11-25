@@ -14,7 +14,7 @@ Raspberry Pi (PIR sensor + camera) -> Mac Mini (person detection + local LLM age
 - `mac/` will hold the Mac Mini side (person detection, local LLM agent, Discord alerts). It is empty for now.
 - `docs/` holds diagrams and notes.
 
-Status: early development, and a learning project. Only the Pi capture side exists so far. Mac dependencies are pinned in `mac/requirements.txt`. There is no build system, linter, or test suite yet.
+Status: early development, and a learning project. The full pipeline works end to end: Pi capture → upload → YOLO → LLM → Discord. Mac dependencies are pinned in `mac/requirements.txt`. There is no build system, linter, or test suite yet.
 
 ## Chosen stack (Mac side, planned)
 
@@ -82,14 +82,24 @@ Verified on 2026-11-25: torch 2.15.0 sees MPS. `mac/yolo26n.pt` (auto-downloaded
 
 ```bash
 python3 pi/pir_test.py        # check PIR wiring: prints motion start/stop events
-python3 pi/motion_capture.py  # 30s sensor warm-up, then saves a photo on each motion event
+python3 pi/motion_capture.py  # 30s sensor warm-up, then captures and uploads on each motion event
 ```
 
 - The PIR sensor is on GPIO 17 (`PIR_PIN`). This constant is duplicated in both scripts, so change it in both places.
-- `motion_capture.py` saves `motion_YYYYMMDD_HHMMSS.jpg` to `~/captures/` by calling `rpicam-still`. After each capture it waits `COOLDOWN_SECONDS`, then waits for the sensor to go idle before re-arming. This keeps one motion event from producing a burst of photos.
+- `motion_capture.py` captures `motion_YYYYMMDD_HHMMSS.jpg` into **RAM** (`/dev/shm/motion-capture/`) by calling `rpicam-still` (30 s timeout), then POSTs it to `MAC_SERVER_URL` as a raw body (`data=f`; requests sets `Content-Length`, which the server requires). Upload timeouts are (3, 15) s. After each capture it waits `COOLDOWN_SECONDS`, then waits for the sensor to go idle before re-arming. This keeps one motion event from producing a burst of photos.
+- If the Mac answers 202, the photo is deleted from RAM, so it never touches the SD card. On any failure (Mac down, 401, and so on) it's moved to `~/captures/` on the SD card. That folder is trimmed to the newest `MAX_KEPT_PHOTOS` (100) by **mtime**, not by filename, because the Pi has no RTC and the clock can be wrong after boot. It's also trimmed at startup.
+- **Nothing may stop the sensor loop.** `handle_motion()` handles the expected errors, and `main()` wraps it in a last-resort `except Exception` that logs and keeps watching. A crashed script would be a silently dead security system.
+- `load_env()` accepts `export KEY=value` and strips matching quotes around values.
+- The Pi reads `.env` with its own small `load_env()`, not python-dotenv, because Debian 13 blocks system-wide `pip install` (PEP 668). The Pi's `.env` holds only `MAC_SERVER_URL` and `UPLOAD_TOKEN`, never the Discord webhook (least privilege).
+- The loop lives in `main()` behind `if __name__ == "__main__"`, so `handle_motion()`, `upload_photo()` and the other functions can be imported and tested on the Pi without the sensor.
+
+### Pi access and deployment
+
+- The Pi is a Raspberry Pi 4 (Debian 13, Python 3.13) with a git clone of this repo at `~/motion-alert-agent`. Deploy with `git pull` on the Pi; never copy files by hand. The repo is **public**, so never commit hostnames, IPs, usernames or tokens. Use placeholders.
+- The Mac reaches the Pi over SSH with key auth (`~/.ssh/id_ed25519`). The Pi reaches the Mac by its `.local` mDNS name on port 8000. The Mac server must run with `--host 0.0.0.0` for the Pi to reach it.
 
 ## Configuration and privacy
 
-- Secrets go in `.env` (template: `.env.example`): `DISCORD_WEBHOOK_URL`, `MAC_SERVER_URL` (where the Pi will send captures), and `UPLOAD_TOKEN` (auth for those uploads). The Mac server reads `UPLOAD_TOKEN` (required, 16+ characters) and `DISCORD_WEBHOOK_URL` (optional; without it the server runs in log-only mode). It also takes the optional `ALERT_COOLDOWN_SECONDS` and `LOG_LEVEL`. The Pi will read `MAC_SERVER_URL` and `UPLOAD_TOKEN`. Load them with `python-dotenv`, and never log their values.
+- Secrets go in `.env` (template: `.env.example`): `DISCORD_WEBHOOK_URL`, `MAC_SERVER_URL` (where the Pi will send captures), and `UPLOAD_TOKEN` (auth for those uploads). The Mac server reads `UPLOAD_TOKEN` (required, 16+ characters) and `DISCORD_WEBHOOK_URL` (optional; without it the server runs in log-only mode). It also takes the optional `ALERT_COOLDOWN_SECONDS` and `LOG_LEVEL`. The Pi reads only `MAC_SERVER_URL` and `UPLOAD_TOKEN`, using its own `load_env()`. The Mac loads `.env` with `python-dotenv`. Never log any of these values.
 - `.gitignore` excludes every image (`*.jpg`, `*.png`, `captures/`), along with `*.db` and `*.pt` model weights, for privacy and size reasons. Don't commit photos or model files.
 - Python virtualenvs are expected at `agent-env/` or `.venv/`.
