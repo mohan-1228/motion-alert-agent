@@ -4,7 +4,7 @@ Run on the Pi from the repo folder:
     python3 pi/motion_capture.py
 
 Needs a .env file in the repo root with:
-    MAC_SERVER_URL=http://Mohans-Mac-mini.local:8000/upload
+    MAC_SERVER_URL=http://<your-mac-name>.local:8000/upload
     UPLOAD_TOKEN=<same value as on the Mac>
 
 Flow for one motion event:
