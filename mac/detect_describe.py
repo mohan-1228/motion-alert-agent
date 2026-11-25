@@ -21,6 +21,7 @@ stage-1 result (a person was seen). The alert still goes out, just without text.
 
 import io
 import os
+import re
 import sys
 from dataclasses import dataclass
 
@@ -34,7 +35,7 @@ from pathlib import Path
 
 import httpx                        # HTTP library the ollama client uses under the hood (for its error types)
 import ollama                       # Python client for the local Ollama server
-from PIL import Image, UnidentifiedImageError   # Pillow: image loading/resizing (installed with ultralytics)
+from PIL import Image, ImageOps, UnidentifiedImageError   # Pillow: image loading/resizing (installed with ultralytics)
 from ultralytics import YOLO        # YOLO object detector
 
 # --- Settings ---------------------------------------------------------------
@@ -50,12 +51,34 @@ MIN_CONFIDENCE = 0.4    # ignore detections YOLO is less than 40% sure about (fe
 VISION_MODEL = "qwen2.5vl:3b"   # Ollama vision model (must be pulled: `ollama pull qwen2.5vl:3b`)
 MAX_IMAGE_SIDE = 1024           # shrink big photos before sending to the LLM (see shrink_for_llm)
 
-PROMPT = (
-    "This is a home security camera photo. Describe ONLY the people in at most "
-    "2 short sentences: their clothing, where they are, and what they are doing. "
-    "Do not describe vehicles, buildings, signs or the background. "
-    "Do not guess identities."
+# The image the LLM gets is already cropped to the people YOLO found (see
+# person_crop_box), so the room is mostly cut out before the model sees it.
+# The prompt then asks for two things in a fixed order: appearance, then
+# action. Lessons from testing (see the describe-person-only PR):
+# - Small models follow "say X, then Y" much better than "don't mention Z".
+# - They copy the prompt's *format*: labelling the parts "Sentence 1:" made
+#   the model print "Sentence 1:" in its answer. So: plain wording, no labels.
+# - "shows a person" made it describe only one of four people, so {who} is
+#   filled in with YOLO's real count ("one person", "3 people").
+PROMPT_TEMPLATE = (
+    "This image is cropped from a home security camera and shows {who}. "
+    "In at most two short, plain sentences with no labels or numbering, say "
+    "what they look like (clothing, colours, anything they carry) and then "
+    "what they are doing (for example walking in, standing, looking at the "
+    "camera, opening a door). Describe only the people, not the room or "
+    "objects around them, and do not guess who they are."
 )
+
+
+def build_prompt(person_count: int) -> str:
+    """Fill YOLO's person count into the prompt."""
+    who = "one person" if person_count == 1 else f"{person_count} people"
+    return PROMPT_TEMPLATE.format(who=who)
+
+# How much margin to keep around the person when cropping, as a fraction of
+# the person's box size. Too tight and the model can't tell what they're
+# doing (opening a door, carrying a box); too loose and the room comes back.
+CROP_MARGIN = 0.15
 # Hard cap on answer length, in tokens (~0.75 words each). This is a safety
 # net, not the main length control: if the model hits it mid-sentence we trim
 # back to the last full sentence in clean_description().
@@ -141,23 +164,77 @@ def detect_people(model: YOLO, image_path: Path):
 
 
 # --- Stage 2: vision LLM ------------------------------------------------------------
-def shrink_for_llm(image_path: Path) -> bytes:
-    """Resize so the longest side is at most MAX_IMAGE_SIDE, return JPEG bytes.
+def person_crop_box(result) -> tuple[int, int, int, int] | None:
+    """The region of the photo to show the LLM: all detected people, plus a margin.
 
-    Why: vision LLMs cut images into small tiles ("vision tokens"). A full-size
-    camera photo makes many tiles -> slower answers and more RAM. 1024 px still
-    shows clothing and location clearly.
+    YOLO gives one box per person as (x1, y1, x2, y2) pixel corners
+    (top-left and bottom-right). We take the smallest rectangle that contains
+    ALL of them (so two people are described together), grow it by
+    CROP_MARGIN on every side, and clamp it to the photo's edges.
+
+    Why crop at all: the model can't describe a shelf or a lamp it never sees.
+    Changing the *input* is far more reliable than asking a small model to
+    ignore part of it. Bonus: a smaller image means fewer vision tokens, so
+    the answer comes faster.
+    """
+    boxes = result.boxes.xyxy.tolist()     # tensor -> plain Python lists of 4 floats
+    x1 = min(b[0] for b in boxes)
+    y1 = min(b[1] for b in boxes)
+    x2 = max(b[2] for b in boxes)
+    y2 = max(b[3] for b in boxes)
+    pad_x = (x2 - x1) * CROP_MARGIN
+    pad_y = (y2 - y1) * CROP_MARGIN
+    height, width = result.orig_shape       # YOLO stores the photo size as (height, width)
+    box = (
+        max(0, int(x1 - pad_x)),            # max/min keep the box inside the photo
+        max(0, int(y1 - pad_y)),
+        min(width, int(x2 + pad_x)),
+        min(height, int(y2 + pad_y)),
+    )
+    if box[2] - box[0] < 1 or box[3] - box[1] < 1:
+        return None                         # degenerate (zero-size) box: use the whole photo
+    return box
+
+
+def safe_crop_box(result) -> tuple[int, int, int, int] | None:
+    """person_crop_box, but never raises: on any surprise, return None
+    (= describe the whole photo). A crop problem must never cost us an alert."""
+    try:
+        return person_crop_box(result)
+    except Exception as e:
+        print(f"Crop box failed ({e.__class__.__name__}); using the whole photo", file=sys.stderr)
+        return None
+
+
+def shrink_for_llm(image_path: Path, crop: tuple[int, int, int, int] | None = None) -> bytes:
+    """Optionally crop, then resize so the longest side is at most MAX_IMAGE_SIDE.
+    Returns JPEG bytes.
+
+    Why resize: vision LLMs cut images into small tiles ("vision tokens"). A
+    full-size camera photo makes many tiles -> slower answers and more RAM.
+    1024 px still shows clothing clearly.
     """
     with Image.open(image_path) as img:
+        # Some cameras store "rotate this 90°" as a tag (EXIF orientation)
+        # instead of rotating the pixels. YOLO applies that tag when it reads
+        # the photo, so we must too, or its box coordinates would point at the
+        # wrong part of the image.
+        img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")                          # JPEG can't store transparency
+        if crop:
+            img = img.crop(crop)                          # (left, top, right, bottom) in pixels
         img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))   # keeps aspect ratio; never enlarges
         buf = io.BytesIO()                                # an in-memory "file"
         img.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
 
-def describe(image_path: Path) -> str | None:
-    """Ask the local vision model to describe the photo. Returns None on failure.
+def describe(image_path: Path, crop: tuple[int, int, int, int] | None = None,
+             person_count: int = 1) -> str | None:
+    """Ask the local vision model to describe the people. Returns None on failure.
+
+    crop: the region to show the model (see person_crop_box). None = whole photo.
+    person_count: how many people YOLO found, so the prompt can say so.
 
     Options explained:
     - keep_alive=0: unload the model from RAM right after answering. Alerts are
@@ -172,10 +249,24 @@ def describe(image_path: Path) -> str | None:
     - ollama.ResponseError: Ollama answered with an error, e.g. model not pulled.
     - httpx.HTTPError: network-level problems, including our timeout.
     """
+    # Prepare the image. If cropping fails for any reason, fall back to the
+    # whole photo; if even that fails, give up on the description. Either way
+    # we return None rather than raise, so the alert itself still goes out.
+    try:
+        image_bytes = shrink_for_llm(image_path, crop)
+    except (OSError, ValueError) as e:
+        print(f"Crop failed ({e.__class__.__name__}); using the whole photo", file=sys.stderr)
+        try:
+            image_bytes = shrink_for_llm(image_path)
+        except (OSError, ValueError) as e:
+            print(f"Description unavailable: image error {e.__class__.__name__}", file=sys.stderr)
+            return None
+
     try:
         response = _ollama.chat(
             model=VISION_MODEL,
-            messages=[{"role": "user", "content": PROMPT, "images": [shrink_for_llm(image_path)]}],
+            messages=[{"role": "user", "content": build_prompt(person_count),
+                       "images": [image_bytes]}],
             keep_alive=0,
             options={"temperature": 0.2, "num_predict": MAX_ANSWER_TOKENS, "num_ctx": 2048},
         )
@@ -193,6 +284,18 @@ def clean_description(text: str | None) -> str | None:
     in an alert. If there's at least one full sentence, keep up to its end.
     """
     text = (text or "").strip()        # treat a missing answer like an empty one
+    # Safety net: drop "Sentence 1:" / "1." style labels if the model adds
+    # them anyway, and join everything into one line for a tidy alert.
+    text = re.sub(r"(?i)\bsentence\s*\d+\s*:\s*", "", text)
+    text = re.sub(r"(?m)^\s*(\d+[.)]|[-*•])\s+", "", text)   # "1. ", "2) ", "- ", "* ", "• " at line start
+    text = " ".join(text.split())      # collapses newlines and repeated spaces
+    # Last safety net against room descriptions: when several people are
+    # spread out, the crop has to stay wide and the model sometimes adds
+    # "The background shows ...". Drop any sentence about the background.
+    # (?<=[.!?])\s+ splits after sentence-ending punctuation.
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept = [s for s in sentences if "background" not in s.lower()]
+    text = " ".join(kept) if kept else text   # never throw away everything
     if not text:
         return None
     if text.endswith((".", "!", "?")):
@@ -238,8 +341,10 @@ def analyze(model: YOLO, image_path: Path, out_dir: Path | None = None,
     return Analysis(
         person_count=count,
         top_confidence=top_conf,
-        # Describe the clean photo, not the one with boxes drawn on it.
-        description=describe(image_path) if want_description else None,
+        # Describe the clean photo (not the one with boxes drawn on it),
+        # cropped to just the people.
+        description=(describe(image_path, safe_crop_box(result), count)
+                     if want_description else None),
         annotated_path=annotated,
     )
 
