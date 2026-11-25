@@ -4,7 +4,6 @@ ultralytics==8.4.218
 torch==2.15.0
 fastapi==0.165.0
 uvicorn==0.54.0
-python-multipart==0.0.34
 ollama==0.6.3
 requests==2.34.2
 python-dotenv==1.2.4
